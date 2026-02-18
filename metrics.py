@@ -8,8 +8,12 @@ import platform
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any
+
+# Optional cache for powermetrics to avoid hammering on fast refresh
+_powermetrics_cache: tuple[float, str] | None = None
 
 
 @dataclass
@@ -32,11 +36,81 @@ class MacMetrics:
     thermal_pressure: str | None = None  # Apple Silicon: Nominal, Moderate, Heavy, Critical
     smc_available: bool = False
     error: str | None = None
+    # Extended metrics (production)
+    swap_total_gb: float = 0.0
+    swap_used_gb: float = 0.0
+    swap_percent: float = 0.0
+    disk_read_bytes: int = 0
+    disk_write_bytes: int = 0
+    uptime_sec: float = 0.0
+    timestamp: float = 0.0  # time.time() at collection
+    # Extended from collectors
+    load_average: dict[str, float] = field(default_factory=dict)  # load_1, load_5, load_15
+    network: dict[str, Any] = field(default_factory=dict)  # bytes_sent, bytes_recv, etc.
+    network_per_interface: list[dict[str, Any]] = field(default_factory=list)
+    processes: list[dict[str, Any]] = field(default_factory=list)
+    disk_mounts: list[dict[str, Any]] = field(default_factory=list)
+    system_info: dict[str, Any] = field(default_factory=dict)
+    cpu_per_cpu: list[float] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for history storage and JSON export. Nested dicts are copied."""
+        return {
+            "cpu_percent": self.cpu_percent,
+            "cpu_count": self.cpu_count,
+            "memory_total_gb": self.memory_total_gb,
+            "memory_used_gb": self.memory_used_gb,
+            "memory_percent": self.memory_percent,
+            "disk_total_gb": self.disk_total_gb,
+            "disk_used_gb": self.disk_used_gb,
+            "disk_percent": self.disk_percent,
+            "swap_total_gb": self.swap_total_gb,
+            "swap_used_gb": self.swap_used_gb,
+            "swap_percent": self.swap_percent,
+            "disk_read_bytes": self.disk_read_bytes,
+            "disk_write_bytes": self.disk_write_bytes,
+            "uptime_sec": self.uptime_sec,
+            "timestamp": self.timestamp,
+            "battery_percent": self.battery_percent,
+            "battery_plugged": self.battery_plugged,
+            "thermal_pressure": self.thermal_pressure,
+            "smc_available": self.smc_available,
+            "error": self.error,
+            "temperatures": dict(self.temperatures),
+            "fan_speeds": dict(self.fan_speeds),
+            "power_estimates": dict(self.power_estimates),
+            "load_average": dict(self.load_average),
+            "network": dict(self.network),
+            "network_per_interface": list(self.network_per_interface),
+            "processes": list(self.processes),
+            "disk_mounts": list(self.disk_mounts),
+            "system_info": dict(self.system_info),
+            "cpu_per_cpu": list(self.cpu_per_cpu),
+        }
 
 
-def _run_powermetrics(timeout_sec: int = 8) -> str:
+def _run_powermetrics(timeout_sec: int | None = None) -> str:
+    """Run powermetrics once. Uses short-lived cache to avoid hammering on fast refresh."""
+    try:
+        from config import POWERMETRICS_CACHE_TTL_SEC, POWERMETRICS_TIMEOUT_SEC
+        ttl = POWERMETRICS_CACHE_TTL_SEC
+        default_timeout = POWERMETRICS_TIMEOUT_SEC
+    except ImportError:
+        ttl = 2
+        default_timeout = 8
+    timeout_sec = timeout_sec if timeout_sec is not None else default_timeout
+    now = time.time()
+    global _powermetrics_cache
+    if _powermetrics_cache is not None and (now - _powermetrics_cache[0]) < ttl:
+        return _powermetrics_cache[1]
+    raw = _run_powermetrics_impl(timeout_sec)
+    if raw:
+        _powermetrics_cache = (now, raw)
+    return raw
+
+
+def _run_powermetrics_impl(timeout_sec: int) -> str:
     """Run powermetrics once. Tries Apple Silicon samplers first, then Intel SMC."""
-    # Apple Silicon: thermal + cpu_power + gpu_power (requires sudo)
     for samplers in ["thermal,cpu_power,gpu_power,ane_power", "thermal,cpu_power,gpu_power", "smc"]:
         try:
             out = subprocess.run(
@@ -138,7 +212,7 @@ def _parse_powermetrics(
 
 
 def _run_external_temp_fan_tools(
-    timeout_sec: int = 3,
+    timeout_sec: int | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     """
     Try optional CLI tools that report temperature and/or fan speed.
@@ -146,6 +220,11 @@ def _run_external_temp_fan_tools(
     - istats (Ruby gem): gem install iStats  →  istats / istats extra
     - osx-cpu-temp (Intel, Homebrew): brew install osx-cpu-temp  →  °C and -f for fan
     """
+    try:
+        from config import EXTERNAL_TOOLS_TIMEOUT_SEC
+        timeout_sec = timeout_sec if timeout_sec is not None else EXTERNAL_TOOLS_TIMEOUT_SEC
+    except ImportError:
+        timeout_sec = timeout_sec if timeout_sec is not None else 3
     temps: dict[str, float] = {}
     fans: dict[str, int] = {}
 
@@ -221,6 +300,7 @@ def _run_external_temp_fan_tools(
 def collect() -> MacMetrics:
     """Collect current system metrics. Safe to call from any thread."""
     m = MacMetrics()
+    m.timestamp = time.time()
 
     if platform.system() != "Darwin":
         m.error = "This tool is for macOS only."
@@ -242,12 +322,36 @@ def collect() -> MacMetrics:
     m.memory_used_gb = vmem.used / (1024**3)
     m.memory_percent = vmem.percent
 
+    # Swap
+    try:
+        swap = psutil.swap_memory()
+        m.swap_total_gb = swap.total / (1024**3)
+        m.swap_used_gb = swap.used / (1024**3)
+        m.swap_percent = swap.percent
+    except Exception:
+        pass
+
     # Disk (root)
     try:
         disk = psutil.disk_usage("/")
         m.disk_total_gb = disk.total / (1024**3)
         m.disk_used_gb = disk.used / (1024**3)
         m.disk_percent = disk.percent
+    except Exception:
+        pass
+
+    # Disk I/O (cumulative bytes; dashboard can compute rate from history)
+    try:
+        io = psutil.disk_io_counters()
+        if io is not None:
+            m.disk_read_bytes = getattr(io, "read_bytes", 0) or 0
+            m.disk_write_bytes = getattr(io, "write_bytes", 0) or 0
+    except Exception:
+        pass
+
+    # Uptime
+    try:
+        m.uptime_sec = time.time() - psutil.boot_time()
     except Exception:
         pass
 
@@ -283,6 +387,43 @@ def collect() -> MacMetrics:
     return m
 
 
+def collect_full() -> MacMetrics:
+    """Collect using all collectors; returns MacMetrics with processes, network, disk_mounts, etc."""
+    m = collect()
+    try:
+        from config import DISK_MOUNTS_MAX, PROCESS_TOP_N
+    except ImportError:
+        DISK_MOUNTS_MAX = 20
+        PROCESS_TOP_N = 20
+    try:
+        from collectors.psutil_collector import PsutilCollector
+        from collectors.powermetrics_collector import PowermetricsCollector
+        from collectors.external_collector import ExternalToolsCollector
+        from collectors.network_collector import NetworkCollector
+        from collectors.process_collector import ProcessCollector
+    except ImportError:
+        return m
+    if m.error:
+        return m
+    pc = PsutilCollector(disk_mounts_max=DISK_MOUNTS_MAX)
+    res = pc.collect_safe()
+    if res.success and res.data:
+        m.load_average = res.data.get("load_average") or {}
+        m.disk_mounts = res.data.get("disk_mounts") or []
+        m.system_info = res.data.get("system_info") or {}
+        m.cpu_per_cpu = res.data.get("cpu_per_cpu") or []
+    nc = NetworkCollector(per_interface=True)
+    res = nc.collect_safe()
+    if res.success and res.data:
+        m.network = res.data.get("network") or {}
+        m.network_per_interface = res.data.get("network_per_interface") or []
+    proc = ProcessCollector(top_n=PROCESS_TOP_N)
+    res = proc.collect_safe()
+    if res.success and res.data:
+        m.processes = res.data.get("processes") or []
+    return m
+
+
 def main() -> None:
     """Print current metrics once using rich."""
     try:
@@ -311,7 +452,16 @@ def main() -> None:
     table.add_column("Value", style="green")
     table.add_row("CPU usage", f"{m.cpu_percent:.1f}% ({m.cpu_count} cores)")
     table.add_row("Memory", f"{m.memory_used_gb:.2f} / {m.memory_total_gb:.2f} GB ({m.memory_percent:.1f}%)")
+    if m.swap_total_gb > 0:
+        table.add_row("Swap", f"{m.swap_used_gb:.2f} / {m.swap_total_gb:.2f} GB ({m.swap_percent:.1f}%)")
     table.add_row("Disk (/)", f"{m.disk_used_gb:.2f} / {m.disk_total_gb:.2f} GB ({m.disk_percent:.1f}%)")
+    if m.disk_read_bytes or m.disk_write_bytes:
+        table.add_row("Disk I/O", f"Read {m.disk_read_bytes / (1024**2):.1f} MB / Write {m.disk_write_bytes / (1024**2):.1f} MB (cumulative)")
+    if m.uptime_sec > 0:
+        days, rest = divmod(int(m.uptime_sec), 86400)
+        hours, rest = divmod(rest, 3600)
+        mins, _ = divmod(rest, 60)
+        table.add_row("Uptime", f"{days}d {hours}h {mins}m" if days else f"{hours}h {mins}m")
     if m.battery_percent is not None:
         plug = "plugged in" if m.battery_plugged else "on battery"
         table.add_row("Battery", f"{m.battery_percent:.0f}% ({plug})")
