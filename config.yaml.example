@@ -1,0 +1,31 @@
+# Mac System Monitor - example config (copy to config.yaml to use)
+dashboard:
+  refresh_min_sec: 1
+  refresh_max_sec: 60
+  refresh_default_sec: 3
+  history_max_points: 300
+  theme: dark
+
+metrics:
+  powermetrics_timeout_sec: 8
+  external_tools_timeout_sec: 3
+  powermetrics_cache_ttl_sec: 2
+  process_top_n: 20
+  disk_mounts_max: 20
+
+alerts:
+  cpu_percent: 90.0
+  memory_percent: 90.0
+  disk_percent: 95.0
+  battery_percent: 10.0
+  enabled: true
+
+api:
+  host: "0.0.0.0"
+  port: 8765
+
+persistence:
+  enabled: false
+  path: "~/.mac_system_monitor/history.json"
+  max_points: 10000
+  save_interval_sec: 60
